@@ -22,41 +22,16 @@
 #include <optional>
 #include <stdexcept>
 #include "typedef.hpp"
+#include "image/raw_rgb8.hpp"
 #include "causal_lm.hpp"
 #include "prefix_slot_cache.hpp"
+#include "prompt_reuse.hpp"
 #include "lm_config.hpp"
 #include "AutoModel/model_backend.hpp"
-#include "models/llama/flm/aie2p/llama_npu.hpp"
-#include "models/qwen2/flm/aie2p/qwen2_npu.hpp"
-#include "models/qwen3/flm/aie2p/qwen3_npu.hpp"
-#include "models/qwen2vl/flm/aie2p/qwen2vl_npu.hpp"
-#include "models/qwen3vl/flm/aie2p/qwen3vl_npu.hpp"
-#include "models/qwen3vl_flash/flm/aie2p/qwen3vl_flash.hpp"
-#include "models/qwen3_5vl/flm/aie2p/qwen3_5vl_npu.hpp"
-#include "models/qwen3_5vl_flash/flm/aie2p/qwen3_5vl_flash.hpp"
-#include "models/minicpm_v_4_7/flm/aie2p/minicpm_v_4_7_npu.hpp"
-#include "models/minicpm_v_4_7_moe/flm/aie2p/minicpm_v_4_7_moe_npu.hpp"
-#include "models/qwen3_6_moe/flm/aie2p/qwen3_6_moe_npu.hpp"
-#include "models/qwen3_8mtp/flm/aie2p/qwen3_8mtp_npu.hpp"
-#include "models/gemma/flm/aie2p/gemma_npu.hpp"
-#include "models/gemma_text/flm/aie2p/gemma_text_npu.hpp"
-#include "models/gemma4e/flm/aie2p/gemma4e_npu.hpp"
-#include "models/gemma4e_flash/flm/aie2p/gemma4e_flash.hpp"
-#include "models/gemma4e_dflash/flm/aie2p/gemma4e_dflash.hpp"
-#include "models/gemma4e_dflash_flash/flm/aie2p/gemma4e_dflash_flash.hpp"
-#include "models/gemma4_12b/flm/aie2p/gemma4_12b_npu.hpp"
-#include "models/lfm2/flm/aie2p/lfm2_npu.hpp"
-#include "models/lfm3/flm/aie2p/lfm3_npu.hpp"
-#include "models/phi4/flm/aie2p/phi4_npu.hpp"
-#include "models/gpt_oss/flm/aie2p/gpt_oss_npu.hpp"
-#include "models/nanbeige/flm/aie2p/nanbeige_npu.hpp"
-#include "models/hunyuan/flm/aie2p/hunyuan_npu.hpp"
 #include "tokenizer/tokenizer.hpp"
 #include "modules/sampler.hpp"
 #include "utils/utils.hpp"
 #include "utils/profiler.hpp"
-#include "tensor_utils/q4_npu_eXpress.hpp"
-#include "npu_utils/npu_utils.hpp"
 #include "minja/chat-template.hpp"
 #include "chat/chat_format.hpp"
 #include "chat/chat_constraint.hpp"
@@ -137,6 +112,11 @@ struct chat_meta_info_t {
 	///       prompt, and the turn starts right after the message's text: insert()
 	///       trims no prompt tokens and generate() feeds no preamble of its own.
 	bool continue_final_message = false;
+	/// \brief Why insert() returned false, for the reply to the client; empty when it did not say
+	/// \note A cancelled prefill leaves it empty: stop_reason (CANCEL_DETECTED) tells that case.
+	std::string error_message;
+	/// \brief HTTP status that goes with error_message: 400 when the request is at fault, 500 otherwise
+	int error_code = 400;
 
 	chat_meta_info_t() : max_prefill_len(0), prompt_tokens(0), cached_prompt_tokens(0), generated_tokens(0), total_duration(0), load_duration(0), prefill_duration(0), decoding_duration(0), stop_reason(EOT_DETECTED), restore_allowed(false) {}
 };
@@ -159,6 +139,9 @@ struct lm_uniform_input_t {
 	nlohmann::ordered_json messages;
 	std::vector<std::string> images;
 	std::vector<input_payload_type_t> image_payload_types;
+	// Raw RGB8 frames of this request; a message's `images` entry {"rgb8": {"batch": b, "frame": f}} names one of them.
+	// Only MiniCPM-V reads them; the server refuses raw frames for every other model.
+	std::vector<std::shared_ptr<const raw_rgb8_batch_t>> raw_rgb8;
 	std::vector<std::string> audios;
 	std::vector<input_payload_type_t> audio_payload_types;
 	nlohmann::ordered_json tools;
@@ -192,15 +175,21 @@ protected:
 	std::string draft_model_path = "";
 	/// \brief the execution backend, which owns the engine
 	std::unique_ptr<flm::backend::ModelBackend> backend_ = nullptr;
+	/// \brief implementation selected for backend_
+	std::string backend_provider_;
 	/// \brief a non-owning view of backend_'s engine, or null when none is loaded
 	causal_lm* lm_engine = nullptr;
 	std::unique_ptr<Tokenizer> tokenizer = nullptr;
 	std::unique_ptr<Sampler> sampler = nullptr;
+	/// \brief the config set_sampler() last made the sampler from, which load_model() sets
+	sampler_config loaded_sampler_config;
+	/// \brief whether thinking was on when save_request_settings() ran
+	bool loaded_thinking = false;
 	bool is_model_loaded = false;
 	std::string current_model = "";
 	std::vector<int> token_history;
 	flm_rt::device* npu_device_inst = nullptr;
-	std::unique_ptr<npu_xclbin_manager> npu = nullptr;
+	std::unique_ptr<npu_xclbin_manager> npu;
 	bool enable_preemption = false;
     std::vector<int> checkpoint_his;
 	/// \brief dump the undecorated model output to stdout once a turn ends
@@ -262,7 +251,9 @@ protected:
 
 
 	void _shared_load_model(std::string model_path, json model_info, int default_context_length = -1, bool enable_preemption = false);
-	void _shared_initialize_model_state(std::string model_path, json model_info, int context_length);
+	void _shared_initialize_model_state(
+		std::string model_path, json model_info, int context_length,
+		const std::string& asset_root = "");
 	/// true if model_path + the entry's draft package are what is already loaded
 	bool _shared_is_same_model(const std::string& model_path, const json& model_info) const;
 	void _shared_initialize_legacy_npu(bool enable_preemption);
@@ -282,7 +273,7 @@ protected:
 	///       for the frontend is the tokenizer, the chat template and the sampler.
 	/// \throws std::runtime_error if the backend is unknown, unavailable for the
 	///         model, or cannot honour the requested preemption/context length
-	void _shared_load_backend(std::string model_path, json model_info, int default_context_length = -1, bool enable_preemption = false, const std::string& requested_backend = "", const nlohmann::json* tokenizer_config = nullptr);
+	void _shared_load_backend(std::string model_path, json model_info, int default_context_length = -1, bool enable_preemption = false, const std::string& requested_backend = "", const nlohmann::json* tokenizer_config = nullptr, bool initialize_host_frontend = true, const std::string& frontend_provider = flm::backend::kBuiltinProviderId);
 
 	/// \brief Drop the conversation after a failed inference
 	/// \param poisoned whether the engine can no longer be driven at all
@@ -308,6 +299,41 @@ protected:
 	/// \param payload the payload, it shall not be used as this function is only used for chunkwised insertion, no image allowed
 	/// \return true if the tokens were inserted successfully, false otherwise
 	bool _shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; }, void* payload = nullptr, int first_len_run = 0, std::optional<int> requested_max_new_tokens = std::nullopt, bool sample_next = true);
+
+	/// \brief decide how much of a prompt with media the engine keeps, before the model trims its payload
+	/// \param tokens the prompt exactly as it will go to _shared_insert / _prefix_insert (after any restore or slot
+	///        resume, with the generation-prompt tokens the model feeds itself already cut)
+	/// \param media its images and audio clips (see prompt_reuse.hpp), with their content hashes
+	/// \return the plan: drop skipped_media[kind] leading items of each payload list and pass media_end as first_len_run
+	/// \note Clears the context when the plan says so, so the _shared_insert that follows skips exactly plan.skip;
+	///       _shared_insert checks that it does when it gets a payload.
+	prompt_reuse_t _plan_reuse(const std::vector<int>& tokens, const std::vector<prompt_media_t>& media);
+	/// \brief the skip _plan_reuse() promised the next _shared_insert with a payload
+	std::optional<size_t> planned_skip_;
+	/// \brief the items (with hashes) of the prompt _plan_reuse() planned; token_history's once _shared_insert read it in
+	std::optional<std::vector<prompt_media_t>> planned_media_;
+	/// \brief the images and audio clips token_history holds, with their content hashes (see plan_prompt_reuse)
+	/// \note nullopt after a prefix-slot resume: the slot cache compared the image hashes itself.
+	std::optional<std::vector<prompt_media_t>> history_media_ = std::vector<prompt_media_t>{};
+	/// \brief the same for checkpoint_his
+	std::optional<std::vector<prompt_media_t>> checkpoint_media_ = std::vector<prompt_media_t>{};
+	/// \brief take the single checkpoint's token history (checkpoint_his) from token_history, with its media
+	void _checkpoint_history() {
+		this->checkpoint_his = this->token_history;
+		this->checkpoint_media_ = this->history_media_;
+	}
+	/// \brief token_history (and its media) back to the single checkpoint's, after lm_engine->restore()
+	void _restore_history() {
+		this->token_history = this->checkpoint_his;
+		this->history_media_ = this->checkpoint_media_;
+	}
+	/// \brief forget the media of token_history and checkpoint_his, and any plan (with the histories themselves)
+	void _forget_history_media() {
+		this->history_media_ = std::vector<prompt_media_t>{};
+		this->checkpoint_media_ = std::vector<prompt_media_t>{};
+		this->planned_skip_.reset();
+		this->planned_media_.reset();
+	}
 
 	// ---- prefix slot cache (see prefix_slot_cache.hpp) ---------------------------------------
 	// Steps every model family with engine snapshots shares; the model supplies the tokens, the image
@@ -373,6 +399,9 @@ protected:
 	void _shared_validate_capacity(std::size_t rendered_tokens, std::optional<int> requested) const;
 	buffer<bf16> _chunked_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; }, void* payload = nullptr, int first_len_run = 0);
 	std::string _shared_generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled = [] { return false; });
+
+	/// \brief asked by _shared_generate after every decoded token; true ends the reply as a length stop
+	virtual bool _stop_generation(const chat_meta_info_t& meta_info) const { (void)meta_info; return false; }
 
 	/// \brief Render the chat template for a request
 	/// \param inputs the template inputs; add_generation_prompt is set here
@@ -462,6 +491,16 @@ public:
 	/// \brief Set the sampler
 	/// \param sampler_config the sampler config
 	virtual void set_sampler(sampler_config& sampler_config);
+
+	/// \brief Remember the settings a request may change, as the model loaded them
+	/// \note Call after load_model()
+	void save_request_settings();
+
+	/// \brief Put back the settings save_request_settings() remembered: sampling and thinking
+	/// \note The server calls it before applying a request's settings, so a setting one
+	///       request leaves out falls back to the model's default rather than to what
+	///       the previous request asked for.
+	void restore_request_settings();
 
 	/// \brief Set the max length
 	/// \param MAX_L the max length
@@ -591,7 +630,15 @@ public:
 	/// \brief The text a token adds to the output, as generate() writes it
 	/// \note Bytes, not necessarily whole UTF-8 characters: a byte level token
 	///       can carry part of one.
-	std::string token_text(int token);
+	virtual std::string token_text(int token);
+
+	/// \brief Encode text with this frontend's tokenizer.
+	/// \note Extension frontends override this instead of exposing a C++
+	///       Tokenizer object across the stable ABI.
+	virtual std::vector<int> encode_text(const std::string& text);
+
+	/// \brief Path used by the host grammar engine for this tokenizer.
+	virtual std::string tokenizer_json_path() const;
 
 	/// \brief Whether every output token goes through _sample(), so logprobs can be reported
 	virtual bool supports_logprobs() const {
@@ -610,12 +657,13 @@ public:
 	/// \param text the text to benchmark
 	/// \return a pair of the number of tokens and the text that produce 1000 tokens
 	std::pair<int, std::string> prepare_benchmark(std::string& text){
-		std::vector<int> tokens = this->tokenizer->encode(text);
+		std::vector<int> tokens = this->encode_text(text);
 		int num_tokens = tokens.size();
 		std::string benchmark_text = text;
 		if (num_tokens > 1000 - 32) {
 			tokens.resize(1000 - 32); // considering that the chat template always add some tokens to it
-			benchmark_text = this->tokenizer->decode(tokens);
+			benchmark_text.clear();
+			for (int token : tokens) benchmark_text += this->token_text(token);
 		}
 		return { num_tokens, benchmark_text };
 	}
@@ -641,10 +689,12 @@ public:
 	///        the previous prompts it can reuse
 	/// \note True makes the server stop clearing the context on a message-level
 	///       cache miss and always pass restore_allowed: the model matches the
-	///       rendered prompt against its saved prefixes and falls back to a full
+	///       rendered prompt against its saved prefixes, or its checkpoint on an
+	///       engine that matches token prefixes, and falls back to a full
 	///       prefill by itself.
 	virtual bool manages_prefix_cache() const {
-		return this->prefix_cache_.enabled();
+		return this->prefix_cache_.enabled() ||
+		       (this->backend_ && this->backend_->matches_token_prefixes());
 	}
 
 	/// \brief --prefix-cache-mb / --prefix-slots / --prefix-min-gain (-1 = the default, 0 slots = off); call before load_model

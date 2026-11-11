@@ -25,6 +25,9 @@ inline void print_help(po::options_description& general) {
     std::cout << "  serve <model_tag>   - Start the  server" << std::endl;
     std::cout << "  pull <model_tag>    - Download model files if not present" << std::endl;
     std::cout << "  remove <model_tag>  - Remove a model" << std::endl;
+#if defined(FLM_ENABLE_OGA_HIPEP)
+    std::cout << "  uninstall hipep     - Remove the hip-ep runtime flm installed for oga-hipep models" << std::endl;
+#endif
     std::cout << "  check <model_tag>   - Check a model" << std::endl;
     std::cout << "  list                - List all available models" << std::endl;
     std::cout << "  version             - Show version information" << std::endl;
@@ -56,6 +59,7 @@ inline void print_help(po::options_description& general) {
     std::cout << "\tflm serve -e embed-gemma:300m" << std::endl;
     std::cout << "\tflm serve llama3.2:1b --modelscope 1" << std::endl;
     std::cout << "\tflm serve qwen3vl-it:4b --img-pre-resize 1" << std::endl;
+    std::cout << "\tflm bench llama3.2:1b --modelscope 1" << std::endl;
     std::cout << "\tflm list" << std::endl;
     std::cout << "\tflm list --quiet" << std::endl;
     std::cout << "\tflm list --filter installed" << std::endl;
@@ -102,12 +106,22 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
              "Set context length")
             ("backend", po::value<std::string>(&parsed_args.backend)->default_value(""),
              "Execution backend to run the model on (default: the model's own). Overrides FLM_BACKEND")
+            ("model-extension",
+             po::value<std::vector<std::string>>(
+                 &parsed_args.model_extensions)->composing(),
+             "Load a model-extension manifest (repeatable)")
             ("prefill-chunk-len,pcl", po::value<int>(&parsed_args.prefill_chunk_len)->default_value(-1),
              "Set prefill chunk length")
             ("prefix-cache-mb", po::value<int>(&parsed_args.prefix_cache_mb)->default_value(-1),
              "Host memory in MiB for saved prompt snapshots (prefix cache), -1: default 4096 (Qwen3.5 and Qwen3.6-MoE)")
             ("prefix-slots", po::value<int>(&parsed_args.prefix_slots)->default_value(-1),
              "How many prompt snapshots to keep (prefix cache), -1: default 8, at most 32, 0: off (Qwen3.5 and Qwen3.6-MoE)")
+            ("max-raw-frames", po::value<int>(&parsed_args.max_raw_frames)->default_value(128),
+             "Most raw RGB8 frames (image_raw, MiniCPM-V only) one request may carry (for serve command)")
+            ("allow-raw-path", po::value<std::string>(&parsed_args.raw_path_dir)->default_value(""),
+             "Directory raw RGB8 frame files may be read from (image_raw 'path'); empty: file input is off (for serve command)")
+            ("max-raw-mb", po::value<int>(&parsed_args.max_raw_mb)->default_value(128),
+             "Most MiB of raw RGB8 pixels one request may carry (for serve command)")
             ("prefix-min-gain", po::value<int>(&parsed_args.prefix_min_gain)->default_value(-1),
              "Prefix cache: a new end-of-prompt snapshot is only saved if it adds at least this many tokens over a saved one that already covers the prompt, "
              "-1: default 128, 0: save every one. Larger = fewer saves and evictions but up to N more tokens re-read on a resume; smaller = the opposite")
@@ -259,6 +273,11 @@ bool parse_options(int argc, char *argv[], program_args_t& parsed_args) {
                 std::cerr << "Error: Model tag is required for command '" << parsed_args.command << "'" << std::endl;
                 return false;
             }
+        }
+        if (parsed_args.command == "uninstall" && parsed_args.model_tag != "hipep" &&
+            parsed_args.model_tag != "hip-ep") {
+            std::cerr << "Error: flm uninstall removes only the hip-ep runtime: run 'flm uninstall hipep'" << std::endl;
+            return false;
         }
 
         return true;

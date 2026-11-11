@@ -325,7 +325,7 @@ import gc
 gc.collect()
 ```
 
-> ⚠️ Sampling settings stay in effect for later requests that don't send them, until the model is reloaded; `seed` applies to its own request only. What each field does, `seed`, the penalty window and model defaults: [Request Parameters & Long Prompts](https://fastflowlm.com/docs/instructions/server/request_parameters/).
+> ℹ️ Sampling settings apply only to the request that sends them; a request that leaves one out gets the model's default. What each field does, `seed`, the penalty window and model defaults: [Request Parameters & Long Prompts](https://fastflowlm.com/docs/instructions/server/request_parameters/).
 
 ---
 
@@ -442,6 +442,8 @@ import gc
 gc.collect()
 ```
 
+> 🎞️ **Video frames:** `minicpm-v-4.7:1b` also accepts decoded RGB8 frames directly (`image_raw`), with no JPEG/PNG encoding. See [Raw RGB Images](https://fastflowlm.com/docs/instructions/server/raw_rgb_images/).
+
 ---
 
 ## 🎙️ Example: Multi-Modal Input
@@ -507,7 +509,7 @@ gc.collect()
 
 ## ⚡ Example: Flash Models (Single-Turn, Pinned System Prompt)
 
-**Flash** models — `gemma4e-flash:e2b`, `gemma4e-flash:e4b`, `nemotron3.5-bolt-dflash-flash:e4b`, `qwen3.5-flash:2b`, `qwen3vl-flash:4b`, and `hy-mt2-flash:1.8b` — trade context length for a much faster time-to-first-token. They are built for high-throughput, short, independent requests: classification, captioning, extraction, routing, translation.
+**Flash** models — `gemma4e-flash:e2b`, `gemma4e-flash:e4b`, `nemotron3.5-bolt-dflash-flash:e4b`, `qwen3vl-flash:4b`, and `hy-mt2-flash:1.8b` — trade context length for a much faster time-to-first-token. They are built for high-throughput, short, independent requests: classification, captioning, extraction, routing, translation.
 
 They are **single-turn**: every request starts from a clean KV state, so earlier turns are not carried over. The system prompt is the one exception — it is prefilled once and cached, so keep it fixed and vary only the user message (and, for vision models, the image).
 
